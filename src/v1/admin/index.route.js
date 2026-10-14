@@ -2,6 +2,10 @@ const index = (prop) => {
   // Declaration
   prop.main_route = "api/admin";
 
+  // Role guard first: every /api/admin call is checked against the user's role (see util/role_guard.js)
+  const { role_guard } = require("../../util/role_guard");
+  prop.app.use(`/${prop.main_route}`, role_guard);
+
   // All Route
   const authRoute = require("./auth/auth.route");
   authRoute(prop);

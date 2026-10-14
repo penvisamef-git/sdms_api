@@ -15,6 +15,8 @@ const userSchema = new mongoose.Schema(
       ref: "User",
       required: false,
     },
+    // which app signed in: "web" | "app" (one session per user per client). Old sessions have none = web.
+    client: { type: String, default: "web" },
     user_data: Object,
   },
   {
@@ -23,4 +25,5 @@ const userSchema = new mongoose.Schema(
 );
 // [perf] request_user runs Session.findOne({ access_token }) on every authenticated request
 userSchema.index({ access_token: 1 });
+userSchema.index({ user_id: 1, client: 1 });
 module.exports = mongoose.model("Session", userSchema);

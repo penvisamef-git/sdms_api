@@ -1,4 +1,4 @@
-const Session = require("../v1/admin/session/session.model"); // adjust the path
+const { getSession } = require("./session_cache");
 
 async function request_by(req, res, next) {
   try {
@@ -13,7 +13,7 @@ async function request_by(req, res, next) {
       token = token.slice(7).trim();
     }
 
-    const session = await Session.findOne({ access_token: token });
+    const session = await getSession(token);
 
     if (!session) {
       return res

@@ -424,6 +424,68 @@ const route = (prop) => {
     },
   );
 
+  // Change MY password (needs the old one). Must stay above `PUT /users/:id`.
+  prop.app.put(
+    `${urlAPI}/change-password`,
+    prop.api_auth,
+    prop.jwt_auth,
+    prop.request_user,
+    async (req, res) => {
+      try {
+        const { user_id: userId } = req.session;
+        const { old_password, new_password } = req.body || {};
+
+        // 400 (not 401) on purpose: the web signs out when it sees 401
+        if (typeof old_password !== "string" || !old_password) {
+          return res.status(400).json({ success: false, message: "សូមបញ្ចូលពាក្យសម្ងាត់ចាស់" });
+        }
+        if (typeof new_password !== "string" || new_password.length < 8) {
+          return res.status(400).json({
+            success: false,
+            message: "ពាក្យសម្ងាត់ថ្មីត្រូវមានយ៉ាងតិច ៨ តួអក្សរ",
+          });
+        }
+        if (old_password === new_password) {
+          return res.status(400).json({
+            success: false,
+            message: "ពាក្យសម្ងាត់ថ្មីត្រូវខុសពីពាក្យសម្ងាត់ចាស់",
+          });
+        }
+
+        const me = await UserModel.findOne({ _id: userId, deleted: false });
+        if (!me) {
+          return res.status(404).json({ success: false, message: noDataFound });
+        }
+        const isMatch = await bcrypt.compare(old_password, me.password);
+        if (!isMatch) {
+          return res.status(400).json({ success: false, message: "ពាក្យសម្ងាត់ចាស់មិនត្រឹមត្រូវ!" });
+        }
+
+        const hashedPassword = await bcrypt.hash(new_password, 10);
+        await UserModel.updateOne(
+          { _id: userId },
+          { $set: { password: hashedPassword, is_first_login: false, updated_by: userId } },
+        );
+
+        // sign out every OTHER device, keep this one
+        await SessionModel.deleteMany({ user_id: userId, _id: { $ne: req.session._id } });
+
+        await logActivity({
+          title: `${document} ${me.firstname} ${me.lastname} ត្រូវបានកែប្រែ!`,
+          description: `គណនី: ${me.email} បានប្តូរពាក្យសម្ងាត់ខ្លួនឯង។`,
+          categoryTitle: logTitle,
+          createdBy: userId,
+          req,
+        });
+
+        res.status(200).json({ success: true, message: "បានប្តូរពាក្យសម្ងាត់ថ្មី!" });
+      } catch (err) {
+        console.error("[change-password]", err);
+        res.status(500).json({ success: false, message: serverError });
+      }
+    },
+  );
+
   prop.app.put(
     `${urlAPI}/:id`,
     prop.api_auth,
@@ -658,11 +720,28 @@ const route = (prop) => {
   prop.app.put(
     `${urlAPI}/update-password-no-token/:id`,
     prop.api_auth,
+    prop.jwt_auth,
+    prop.request_user,
     async (req, res) => {
       try {
         // ───────────────────────────────────────────────
         // ✅  ID
         const { id } = req.params;
+
+        // only for yourself, and only while the password still has to be set (after an admin reset / new account)
+        if (String(req.session.user_id) !== String(id)) {
+          return res.status(403).json({
+            success: false,
+            message: "អ្នកមិនមានសិទ្ធិប្តូរពាក្យសម្ងាត់របស់អ្នកដទៃទេ!",
+          });
+        }
+        const target = await UserModel.findOne({ _id: id, deleted: false }).select("is_first_login").lean();
+        if (!target || target.is_first_login !== true) {
+          return res.status(403).json({
+            success: false,
+            message: "សូមប្រើមុខងារ ប្តូរពាក្យសម្ងាត់ (ត្រូវការពាក្យសម្ងាត់ចាស់)!",
+          });
+        }
 
         const requiredFields = [{ key: "password", label: "ពាក្យសម្ងាត់" }];
         if (!checkValidtion(res, req, requiredFields)) return;
@@ -737,88 +816,6 @@ const route = (prop) => {
       }
     },
   );
-
-  prop.app.put(
-    `${urlAPI}/update-password-no-token/for-teacher/:id`,
-    prop.api_auth,
-    async (req, res) => {
-      try {
-        // ───────────────────────────────────────────────
-        // ✅ ID
-        const { id } = req.params;
-
-        const requiredFields = [{ key: "password", label: "ពាក្យសម្ងាត់" }];
-        if (!checkValidtion(res, req, requiredFields)) return;
-
-        // ───────────────────────────────────────────────
-        // ✅ Validate ID
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-          return res.status(400).json({
-            success: false,
-            message: noIDFound,
-          });
-        }
-
-        // ───────────────────────────────────────────────
-        // ✅ Hash the password
-        const hashedPassword = req.body.password;
-        
-        // ───────────────────────────────────────────────
-        // ✅ Build update fields
-        const updateFields = {
-          password: hashedPassword,
-        };
-
-        // ───────────────────────────────────────────────
-        // ✅ Remove empty fields (null or undefined)
-        Object.keys(updateFields).forEach(
-          (key) => (updateFields[key] == null || updateFields[key] === "") && delete updateFields[key],
-        );
-
-        // ───────────────────────────────────────────────
-        // ✅ Ensure there's at least one field to update
-        if (Object.keys(updateFields).length === 0) {
-          return res.status(400).json({
-            success: false,
-            message: "សូមបញ្ចូលពាក្យសម្ងាត់ថ្មី!",
-          });
-        }
-
-        // ───────────────────────────────────────────────
-        // ✅ Update teacher
-        const updatedData = await ModelTeacher.findByIdAndUpdate(
-          id,
-          updateFields,
-          {
-            new: true,
-            runValidators: true,
-          },
-        );
-
-        if (!updatedData) {
-          return res.status(404).json({
-            success: false,
-            message: noDataFound,
-          });
-        }
-
-        // ───────────────────────────────────────────────
-        // ✅ Response
-        res.status(200).json({
-          success: true,
-          data: updatedData,
-          message: `ពាក្យសម្ងាត់របស់ ${updatedData.info_firstname_kh || ''} ${updatedData.info_lastname_kh || ''} បានកែប្រែដោយជោគជ័យ!`,
-        });
-      } catch (err) {
-        console.error("❌ Error updating password:", err);
-        res.status(500).json({
-          success: false,
-          message: serverError,
-          error: err.message,
-        });
-      }
-    },
-);
 
   // ===================================== App ================================================
   prop.app.get(
