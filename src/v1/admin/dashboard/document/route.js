@@ -12,7 +12,7 @@ const getFilteredMongoDB = require("../../../../util/mongo_db/mongoDB_Queries");
 const { logActivity } = require("../../../../util/log");
 const { sanitizeUpdate } = require("../../../../util/helper");
 const multer = require("multer");
-const { uploadBuffer } = require("../../../../util/cloudinary");
+const { uploadBuffer, cloudinary } = require("../../../../util/cloudinary");
 
 // ───────────── multipart/form-data support (files + fields in one request) ─────────────
 const MAX_FILE_MB = 20;
@@ -471,6 +471,8 @@ const route = (prop) => {
   // PUT /document/:id/file  (multipart/form-data)
   //   file      = new signed PDF (required)
   //   public_id = public_id of the existing file to replace (required)
+  // OR JSON (for big PDFs the browser already uploaded straight to Cloudinary — Vercel limits a request body to ~4.5MB):
+  //   { public_id, file: { public_id, resource_type } }   (url / bytes / format are re-read from Cloudinary, not trusted)
   // Allowed: a receiver who still holds the document (transfer pending/received),
   //          or the owner office (incl. super admin) while the document has not been sent yet.
   // The old file stays on Cloudinary (recoverable). Only that one entry is replaced.
@@ -506,10 +508,14 @@ const route = (prop) => {
         // ✅ Validate input
         const file = req.file;
         const public_id = String(req.body?.public_id || "").trim();
-        if (!file) return res.status(400).json({ success: false, message: "សូមជ្រើសរើសឯកសារ PDF ដែលបានចុះហត្ថលេខា!" });
+        // [big-file] JSON form: the signed PDF is already on Cloudinary
+        const direct = !file && req.body?.file && typeof req.body.file === "object" ? req.body.file : null;
+        if (!file && !direct) return res.status(400).json({ success: false, message: "សូមជ្រើសរើសឯកសារ PDF ដែលបានចុះហត្ថលេខា!" });
         if (!public_id) return res.status(400).json({ success: false, message: "សូមបញ្ចូល public_id របស់ឯកសារដែលត្រូវជំនួស!" });
-        const isPdf = file.mimetype === "application/pdf" || /\.pdf$/i.test(file.originalname || "");
-        if (!isPdf) return res.status(400).json({ success: false, message: "អនុញ្ញាតតែឯកសារ PDF ប៉ុណ្ណោះ!" });
+        if (file) {
+          const isPdf = file.mimetype === "application/pdf" || /\.pdf$/i.test(file.originalname || "");
+          if (!isPdf) return res.status(400).json({ success: false, message: "អនុញ្ញាតតែឯកសារ PDF ប៉ុណ្ណោះ!" });
+        }
 
         // ✅ Permission
         const me = await getMe(req);
@@ -545,7 +551,35 @@ const route = (prop) => {
         if (!kind) return res.status(404).json({ success: false, message: "រកមិនឃើញឯកសារនេះក្នុងឯកសារ" });
 
         // ✅ Upload the signed PDF (keep the old display name)
-        const newFile = await uploadBuffer(file, kind === "main" ? "documents" : "references");
+        let newFile;
+        if (file) {
+          newFile = await uploadBuffer(file, kind === "main" ? "documents" : "references");
+        } else {
+          // [big-file] already uploaded by the browser: it must live in this app's Cloudinary folder, and we read its
+          // real info back from Cloudinary (never trust url / bytes sent by the client)
+          const newId = String(direct.public_id || "").trim();
+          const folderPrefix = `${process.env.CLOUDINARY_FOLDER || "sdms"}/${kind === "main" ? "documents" : "references"}/`;
+          if (!newId.startsWith(folderPrefix) || newId.includes("..")) {
+            return res.status(400).json({ success: false, message: "ឯកសារដែលបាន upload មិនត្រឹមត្រូវ!" });
+          }
+          let info;
+          try {
+            info = await cloudinary.api.resource(newId, { resource_type: direct.resource_type || "image" });
+          } catch (e) {
+            return res.status(400).json({ success: false, message: "រកមិនឃើញឯកសារដែលបាន upload ទេ!" });
+          }
+          if (String(info.format || "").toLowerCase() !== "pdf") {
+            return res.status(400).json({ success: false, message: "អនុញ្ញាតតែឯកសារ PDF ប៉ុណ្ណោះ!" });
+          }
+          newFile = {
+            url: info.secure_url,
+            public_id: info.public_id,
+            resource_type: info.resource_type,
+            format: info.format,
+            bytes: info.bytes,
+            original_name: oldFile.original_name,
+          };
+        }
         newFile.original_name = oldFile.original_name;
 
         // ✅ Replace only that entry
